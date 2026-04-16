@@ -254,6 +254,17 @@ class OAuthHandler(BaseHTTPRequestHandler):
         <p>正在跳转回应用...</p>
         <p><small>如果没有自动跳转，<a href="{redirect_url}">请点击这里</a></small></p>
     </div>
+    <script>
+        // Mac 应用使用 URL Scheme 回调，跳转后页面可直接关闭
+        // Windows 应用使用 localhost 回调，由应用端页面关闭
+        setTimeout(function() {{
+            window.location.href = "{redirect_url}";
+        }}, 800);
+        // 跳转完成后 3 秒尝试关闭（对 Windows localhost 回调有效）
+        setTimeout(function() {{
+            window.close();
+        }}, 3500);
+    </script>
 </body>
 </html>"""
 

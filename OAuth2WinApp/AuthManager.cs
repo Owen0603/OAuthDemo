@@ -21,7 +21,7 @@ namespace OAuth2WinApp
         private const string TokenEndpoint = "http://localhost:8089/token";
         private const string UserInfoEndpoint = "http://localhost:8089/userinfo";
         private const string ClientID = "demo-win-app";
-        private const string RedirectURI = "http://localhost:8769/callback";
+        private const string RedirectURI = "http://127.0.0.1:8769/callback";
 
         // PKCE 参数
         private string _codeVerifier = "";
@@ -114,12 +114,23 @@ namespace OAuth2WinApp
             await WaitForCallbackAsync();
         }
 
-        // 启动本地 HTTP 监听器
+        // 启动本地 HTTP 监听器（同时监听 IPv4 和 IPv6，避免 localhost 解析差异导致回调失败）
         private void StartLocalListener()
         {
             StopLocalListener();
             _httpListener = new HttpListener();
-            _httpListener.Prefixes.Add("http://localhost:8769/");
+            // 同时绑定 IPv4(127.0.0.1) 和 IPv6(::1)，Windows 上 localhost 可能解析为任意一个
+            try
+            {
+                _httpListener.Prefixes.Add("http://127.0.0.1:8769/");
+                _httpListener.Prefixes.Add("http://[::1]:8769/");
+            }
+            catch
+            {
+                // 若 IPv6 不可用，仅用 IPv4
+                _httpListener.Prefixes.Clear();
+                _httpListener.Prefixes.Add("http://127.0.0.1:8769/");
+            }
             _httpListener.Start();
         }
 
@@ -145,7 +156,7 @@ namespace OAuth2WinApp
                 var request = context.Request;
                 var queryParams = request.QueryString;
 
-                // 返回成功页面给浏览器
+                // 返回成功页面给浏览器（3 秒后自动关闭标签页）
                 var responseHtml = """
                     <!DOCTYPE html>
                     <html><head><meta charset="UTF-8"><title>授权成功</title>
@@ -154,8 +165,10 @@ namespace OAuth2WinApp
                                min-height: 100vh; display: flex; align-items: center; justify-content: center; color: white; }
                         .card { background: rgba(255,255,255,0.2); backdrop-filter: blur(10px); padding: 40px 60px; border-radius: 16px; text-align: center; }
                     </style></head>
-                    <body><div class="card"><h1>✅</h1><h2>授权成功!</h2><p>请返回应用查看结果，可以关闭此页面。</p></div></body>
-                    </html>
+                    <body>
+                    <div class="card"><h1>✅</h1><h2>授权成功!</h2><p>正在返回应用，此页面将自动关闭...</p></div>
+                    <script>setTimeout(function(){ window.close(); }, 2000);</script>
+                    </body></html>
                     """;
                 var buffer = Encoding.UTF8.GetBytes(responseHtml);
                 context.Response.ContentType = "text/html; charset=utf-8";
