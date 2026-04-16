@@ -7,7 +7,6 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Threading.Tasks;
-using System.Web;
 using System.ComponentModel;
 using System.Runtime.CompilerServices;
 using System.Diagnostics;
@@ -98,16 +97,15 @@ namespace OAuth2WinApp
             StartLocalListener();
 
             // 构建授权 URL
-            var queryParams = HttpUtility.ParseQueryString(string.Empty);
-            queryParams["response_type"] = "code";
-            queryParams["client_id"] = ClientID;
-            queryParams["redirect_uri"] = RedirectURI;
-            queryParams["scope"] = "openid profile email";
-            queryParams["state"] = _state;
-            queryParams["code_challenge"] = codeChallenge;
-            queryParams["code_challenge_method"] = "S256";
-
-            var url = $"{AuthorizationEndpoint}?{queryParams}";
+            static string Encode(string v) => Uri.EscapeDataString(v);
+            var url = $"{AuthorizationEndpoint}"
+                + $"?response_type=code"
+                + $"&client_id={Encode(ClientID)}"
+                + $"&redirect_uri={Encode(RedirectURI)}"
+                + $"&scope={Encode("openid profile email")}"
+                + $"&state={Encode(_state)}"
+                + $"&code_challenge={Encode(codeChallenge)}"
+                + $"&code_challenge_method=S256";
 
             // 打开浏览器进行授权
             Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
