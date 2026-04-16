@@ -1,0 +1,17 @@
+# macOS
+.DS_Store
+
+# Xcode
+OAuth2MacApp/OAuth2MacApp.xcodeproj/xcuserdata/
+OAuth2MacApp/OAuth2MacApp.xcodeproj/project.xcworkspace/xcuserdata/
+build/
+DerivedData/
+*.xcuserstate
+
+# .NET
+OAuth2WinApp/bin/
+OAuth2WinApp/obj/
+
+# Python
+__pycache__/
+*.pyc
