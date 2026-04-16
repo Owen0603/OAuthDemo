@@ -11,6 +11,7 @@ using System.Web;
 using System.ComponentModel;
 using System.Runtime.CompilerServices;
 using System.Diagnostics;
+using System.IO;
 
 namespace OAuth2WinApp
 {
@@ -29,6 +30,9 @@ namespace OAuth2WinApp
 
         // 本地 HTTP 监听器，用于接收回调
         private HttpListener? _httpListener;
+
+        // Python mock server 进程
+        private Process? _serverProcess;
 
         private static readonly HttpClient _httpClient = new();
 
@@ -80,6 +84,10 @@ namespace OAuth2WinApp
         public async Task StartOAuthLoginAsync()
         {
             ErrorMessage = null;
+
+            // 确保 mock server 已启动
+            if (!await EnsureServerRunningAsync())
+                return;
 
             // 生成 PKCE code_verifier 和 code_challenge
             _codeVerifier = GenerateCodeVerifier();
@@ -287,6 +295,148 @@ namespace OAuth2WinApp
             Email = "";
             _codeVerifier = "";
             _state = "";
+        }
+
+        // 启动并等待 Mock OAuth Server 就绪
+        private async Task<bool> EnsureServerRunningAsync()
+        {
+            // 先检测服务器是否已经在运行
+            if (await IsServerReady())
+                return true;
+
+            // 查找 mock_oauth_server.py 的路径
+            var serverScript = FindServerScript();
+            if (serverScript == null)
+            {
+                ErrorMessage = "未找到 mock_oauth_server.py，请确保它在应用上级目录中";
+                return false;
+            }
+
+            // 查找 Python 可执行文件
+            var pythonCmd = FindPython();
+            if (pythonCmd == null)
+            {
+                ErrorMessage = "未找到 Python，请安装 Python 3 并添加到 PATH";
+                return false;
+            }
+
+            // 启动 Python 服务器
+            try
+            {
+                _serverProcess = new Process
+                {
+                    StartInfo = new ProcessStartInfo
+                    {
+                        FileName = pythonCmd,
+                        Arguments = $"\"{serverScript}\"",
+                        UseShellExecute = false,
+                        CreateNoWindow = true,
+                        RedirectStandardOutput = true,
+                        RedirectStandardError = true,
+                    }
+                };
+                _serverProcess.Start();
+            }
+            catch (Exception ex)
+            {
+                ErrorMessage = $"无法启动 OAuth 服务器: {ex.Message}";
+                return false;
+            }
+
+            // 等待服务器就绪（最多 10 秒）
+            for (int i = 0; i < 20; i++)
+            {
+                await Task.Delay(500);
+                if (await IsServerReady())
+                    return true;
+
+                if (_serverProcess.HasExited)
+                {
+                    ErrorMessage = "OAuth 服务器启动失败，请检查 Python 环境";
+                    return false;
+                }
+            }
+
+            ErrorMessage = "OAuth 服务器启动超时";
+            return false;
+        }
+
+        private static async Task<bool> IsServerReady()
+        {
+            try
+            {
+                var response = await _httpClient.GetAsync("http://localhost:8089/");
+                return true; // 任何响应都说明服务器在运行
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static string? FindServerScript()
+        {
+            // 依次向上查找 mock_oauth_server.py
+            var dir = AppDomain.CurrentDomain.BaseDirectory;
+            for (int i = 0; i < 5; i++)
+            {
+                var candidate = Path.Combine(dir, "mock_oauth_server.py");
+                if (File.Exists(candidate))
+                    return candidate;
+                var parent = Directory.GetParent(dir);
+                if (parent == null) break;
+                dir = parent.FullName;
+            }
+
+            // 也检查工作目录
+            var cwdCandidate = Path.Combine(Directory.GetCurrentDirectory(), "mock_oauth_server.py");
+            if (File.Exists(cwdCandidate))
+                return cwdCandidate;
+
+            // 检查项目同级目录
+            var projectDir = Directory.GetCurrentDirectory();
+            var projectParent = Directory.GetParent(projectDir);
+            if (projectParent != null)
+            {
+                var siblingCandidate = Path.Combine(projectParent.FullName, "mock_oauth_server.py");
+                if (File.Exists(siblingCandidate))
+                    return siblingCandidate;
+            }
+
+            return null;
+        }
+
+        private static string? FindPython()
+        {
+            foreach (var cmd in new[] { "python", "python3", "py" })
+            {
+                try
+                {
+                    var process = Process.Start(new ProcessStartInfo
+                    {
+                        FileName = cmd,
+                        Arguments = "--version",
+                        UseShellExecute = false,
+                        CreateNoWindow = true,
+                        RedirectStandardOutput = true,
+                    });
+                    process?.WaitForExit(3000);
+                    if (process?.ExitCode == 0)
+                        return cmd;
+                }
+                catch { }
+            }
+            return null;
+        }
+
+        // 应用退出时关闭服务器
+        public void StopServer()
+        {
+            if (_serverProcess != null && !_serverProcess.HasExited)
+            {
+                try { _serverProcess.Kill(); } catch { }
+                _serverProcess = null;
+            }
         }
 
         // PKCE 辅助方法

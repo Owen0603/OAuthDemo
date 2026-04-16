@@ -10,6 +10,7 @@ namespace OAuth2WinApp
         {
             InitializeComponent();
             _authManager.PropertyChanged += AuthManager_PropertyChanged;
+            Closing += (_, _) => _authManager.StopServer();
         }
 
         private void AuthManager_PropertyChanged(object? sender, System.ComponentModel.PropertyChangedEventArgs e)

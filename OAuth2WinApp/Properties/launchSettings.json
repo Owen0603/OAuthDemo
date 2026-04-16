@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "OAuth2WinApp": {
+      "commandName": "Project",
+      "dotnetRunMessages": true
+    }
+  }
+}
