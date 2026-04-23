@@ -16,6 +16,7 @@ type ApiResponse = Record<string, unknown>;
 const flowApiBase = ref('/demo-api');
 const busy = ref(false);
 const logs = ref<string[]>([]);
+const FETCH_TIMEOUT_MS = 60 * 1000;
 
 const config = ref<FlowConfig | null>(null);
 
@@ -52,8 +53,36 @@ function apiUrl(path: string): string {
   return `${base}${path}`;
 }
 
+async function fetchWithTimeout(input: string, init?: RequestInit): Promise<Response> {
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(new Error('timeout')), FETCH_TIMEOUT_MS);
+
+  if (init?.signal) {
+    if (init.signal.aborted) {
+      controller.abort(init.signal.reason);
+    } else {
+      init.signal.addEventListener('abort', () => controller.abort(init.signal?.reason), { once: true });
+    }
+  }
+
+  try {
+    return await fetch(input, {
+      ...init,
+      signal: controller.signal,
+    });
+  } finally {
+    window.clearTimeout(timeoutId);
+  }
+}
+
 async function callApi(path: string, init?: RequestInit): Promise<{ ok: boolean; status: number; data: ApiResponse }> {
-  const res = await fetch(apiUrl(path), init);
+  let res: Response;
+  try {
+    res = await fetchWithTimeout(apiUrl(path), init);
+  } catch (error) {
+    return { ok: false, status: 0, data: { error: `请求失败: ${String(error)}` } };
+  }
+
   let data: ApiResponse = {};
   try {
     data = (await res.json()) as ApiResponse;
@@ -64,7 +93,13 @@ async function callApi(path: string, init?: RequestInit): Promise<{ ok: boolean;
 }
 
 async function callApiDirect(url: string, init?: RequestInit): Promise<{ ok: boolean; status: number; data: ApiResponse }> {
-  const res = await fetch(url, init);
+  let res: Response;
+  try {
+    res = await fetchWithTimeout(url, init);
+  } catch (error) {
+    return { ok: false, status: 0, data: { error: `请求失败: ${String(error)}` } };
+  }
+
   let data: ApiResponse = {};
   try {
     data = (await res.json()) as ApiResponse;
