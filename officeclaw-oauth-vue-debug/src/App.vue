@@ -1,6 +1,5 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue';
-import { SignJWT, exportJWK, generateKeyPair } from 'jose';
 
 type FlowConfig = {
   authBase: string;
@@ -90,65 +89,6 @@ async function callApi(path: string, init?: RequestInit): Promise<{ ok: boolean;
     data = { error: '非 JSON 响应' };
   }
   return { ok: res.ok, status: res.status, data };
-}
-
-async function callApiDirect(url: string, init?: RequestInit): Promise<{ ok: boolean; status: number; data: ApiResponse }> {
-  let res: Response;
-  try {
-    res = await fetchWithTimeout(url, init);
-  } catch (error) {
-    return { ok: false, status: 0, data: { error: `请求失败: ${String(error)}` } };
-  }
-
-  let data: ApiResponse = {};
-  try {
-    data = (await res.json()) as ApiResponse;
-  } catch {
-    data = { raw: await res.text().catch(() => '') };
-  }
-  return { ok: res.ok, status: res.status, data };
-}
-
-function toBase64Url(bytes: Uint8Array): string {
-  let binary = '';
-  for (let i = 0; i < bytes.length; i += 1) binary += String.fromCharCode(bytes[i]);
-  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
-}
-
-function randomBase64Url(byteLength: number): string {
-  const bytes = new Uint8Array(byteLength);
-  crypto.getRandomValues(bytes);
-  return toBase64Url(bytes);
-}
-
-function parseIdTokenClaims(idToken: string): { sub?: string; preferred_username?: string; name?: string } {
-  try {
-    const parts = String(idToken || '').split('.');
-    if (parts.length < 2) return {};
-    const payloadBase64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
-    const normalized = payloadBase64.padEnd(Math.ceil(payloadBase64.length / 4) * 4, '=');
-    const payloadText = atob(normalized);
-    const payload = JSON.parse(payloadText) as Record<string, unknown>;
-    return {
-      sub: typeof payload.sub === 'string' ? payload.sub : undefined,
-      preferred_username: typeof payload.preferred_username === 'string' ? payload.preferred_username : undefined,
-      name: typeof payload.name === 'string' ? payload.name : undefined,
-    };
-  } catch {
-    return {};
-  }
-}
-
-async function generateDpopProof(method: string, url: string): Promise<string> {
-  const { privateKey, publicKey } = await generateKeyPair('ES256', { extractable: true });
-  const publicJwk = await exportJWK(publicKey);
-  const iat = Math.floor(Date.now() / 1000);
-  const jti = randomBase64Url(16);
-  return new SignJWT({ htm: method.toUpperCase(), htu: url, jti })
-    .setProtectedHeader({ alg: 'ES256', typ: 'dpop+jwt', jwk: publicJwk })
-    .setIssuedAt(iat)
-    .setExpirationTime(iat + 120)
-    .sign(privateKey);
 }
 
 async function withBusy(title: string, fn: () => Promise<void>) {
@@ -250,52 +190,33 @@ async function step4ExchangeToken(): Promise<void> {
       return;
     }
 
-    if (!config.value?.iamTokenUrl || !config.value?.clientId || !config.value?.redirectUri) {
-      log('缺少 iamTokenUrl/clientId/redirectUri 配置');
-      return;
-    }
-
     if (callbackState.value.trim() !== state.value.trim()) {
       log('警告：回调 state 与 Step1 生成 state 不一致，请确认登录流程是否被打断');
     }
 
-    const dpopProof = await generateDpopProof('POST', config.value.iamTokenUrl);
-    const body = new URLSearchParams({
-      client_id: config.value.clientId,
-      code: callbackCode.value.trim(),
-      code_verifier: codeVerifier.value.trim(),
-      grant_type: 'authorization_code',
-      redirect_uri: config.value.redirectUri,
-    });
-
-    const res = await callApiDirect(config.value.iamTokenUrl, {
+    const res = await callApi('/flow/exchange', {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Type': 'application/json',
         Accept: 'application/json',
-        DPoP: dpopProof,
       },
-      body: body.toString(),
+      body: JSON.stringify({
+        code: callbackCode.value.trim(),
+        state: callbackState.value.trim(),
+      }),
     });
 
-    tokenResult.value = {
-      success: res.ok,
-      tokenEndpoint: config.value.iamTokenUrl,
-      tokenResponse: res.data,
-    };
+    tokenResult.value = res.data;
     if (!res.ok) {
       log(`换token失败: ${res.status}`);
-      log('提示：若浏览器跨域拦截，请在 Network 面板查看 CORS 报错');
       return;
     }
 
-    const tokenData = res.data;
+    const tokenData = (res.data.tokenResponse as ApiResponse | undefined) || {};
     credential.value = (tokenData.credential as ApiResponse | undefined) || null;
     refreshTokenValue.value = String(tokenData.refresh_token || '');
-
-    const claims = parseIdTokenClaims(String(tokenData.id_token || ''));
-    currentUserId.value = claims.sub || `oauth-${randomBase64Url(8)}`;
-    currentUserName.value = claims.preferred_username || claims.name || currentUserId.value;
+    currentUserId.value = String(res.data.userId || '');
+    currentUserName.value = String(res.data.userName || '');
     permissionResult.value = null;
     log(`换token成功: userId=${currentUserId.value || '(空)'}`);
   });
@@ -308,39 +229,21 @@ async function step5ValidatePermission(): Promise<void> {
       return;
     }
 
-    if (!config.value?.huaweiClawBase) {
-      log('缺少 huaweiClawBase 配置');
-      return;
-    }
-
-    const permissionUrl = `${config.value.huaweiClawBase}/v1/claw/permission-validate`;
-    const headers: Record<string, string> = {};
-    const secToken = String(credential.value.securityToken || '');
-    const projectId = String(credential.value.project_id || '');
-    if (secToken) headers['X-Security-Token'] = secToken;
-    if (projectId) headers['X-Project-ID'] = projectId;
-
-    const res = await callApiDirect(permissionUrl, {
-      method: 'GET',
+    const res = await callApi('/flow/permission-validate', {
+      method: 'POST',
       headers: {
-        ...headers,
+        'Content-Type': 'application/json',
         Accept: 'application/json',
       },
+      body: JSON.stringify({ userId: currentUserId.value.trim() }),
     });
 
-    permissionResult.value = {
-      success: res.ok,
-      userId: currentUserId.value,
-      url: permissionUrl,
-      status: res.status,
-      body: res.data,
-    };
+    permissionResult.value = res.data;
     if (!res.ok) {
       log(`permission-validate 失败: ${res.status}`);
-      log('提示：若浏览器跨域拦截，请在 Network 面板查看 CORS 报错');
       return;
     }
-    log(`permission-validate 完成: status=${res.status}`);
+    log(`permission-validate 完成: status=${String(res.data.status || res.status)}`);
   });
 }
 
@@ -356,41 +259,22 @@ async function step6RefreshToken(): Promise<void> {
       return;
     }
 
-    if (!config.value?.iamTokenUrl || !config.value?.clientId) {
-      log('缺少 iamTokenUrl/clientId 配置');
-      return;
-    }
-
-    const dpopProof = await generateDpopProof('POST', config.value.iamTokenUrl);
-    const body = new URLSearchParams({
-      client_id: config.value.clientId,
-      grant_type: 'refresh_token',
-      refresh_token: refreshTokenValue.value.trim(),
-    });
-
-    const res = await callApiDirect(config.value.iamTokenUrl, {
+    const res = await callApi('/flow/refresh', {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Type': 'application/json',
         Accept: 'application/json',
-        DPoP: dpopProof,
       },
-      body: body.toString(),
+      body: JSON.stringify({ userId: currentUserId.value.trim() }),
     });
 
-    refreshResult.value = {
-      success: res.ok,
-      userId: currentUserId.value,
-      tokenEndpoint: config.value.iamTokenUrl,
-      tokenResponse: res.data,
-    };
+    refreshResult.value = res.data;
     if (!res.ok) {
       log(`刷新token失败: ${res.status}`);
-      log('提示：若浏览器跨域拦截，请在 Network 面板查看 CORS 报错');
       return;
     }
 
-    const tokenData = res.data;
+    const tokenData = (res.data.tokenResponse as ApiResponse | undefined) || {};
     const nextCredential = (tokenData.credential as ApiResponse | undefined) || null;
     if (nextCredential) credential.value = nextCredential;
     if (String(tokenData.refresh_token || '').trim()) {
