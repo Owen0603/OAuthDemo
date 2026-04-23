@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "jose": "^5.9.6",
+    "undici": "^6.25.0",
     "vue": "^3.5.13"
   },
   "devDependencies": {
