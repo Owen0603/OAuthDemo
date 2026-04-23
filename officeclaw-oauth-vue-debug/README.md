@@ -40,9 +40,9 @@ npm run dev
 - 默认 `redirect_uri` 是本地页：`http://127.0.0.1:3008/demo-callback`
 - 授权成功后会跳到本地捕获页，点击“复制完整回调URL”，粘贴到 Step3 输入框解析
 - Step3 同样支持粘贴 `officeclaw://oauth/callback?...` 或普通 URL 回调地址自动提取参数
-- Step4 发起真实换 token 请求
-- Step5 由 Vue 主动调用后端 `/demo-api/flow/permission-validate` 并展示结果
-- Step6 用 refresh_token 发起刷新请求
+- Step4 由 Vue 直接调用 IAM `/v1/oauth2/tokens` 完成换 token
+- Step5 由 Vue 直接调用 `permission-validate` 并展示结果
+- Step6 由 Vue 用 refresh_token 直接调用 IAM 刷新
 
 ## 注意
 
