@@ -1,7 +1,9 @@
 import { createHash, randomBytes } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { URL } from 'node:url';
 import { SignJWT, exportJWK, generateKeyPair } from 'jose';
+import { Agent } from 'undici';
 
 const PORT = Number(process.env.DEMO_FLOW_PORT || 3008);
 const HOST = process.env.DEMO_FLOW_HOST || '127.0.0.1';
@@ -23,6 +25,29 @@ const pendingStates = new Map();
 const sessions = new Map();
 const STATE_TTL_MS = 10 * 60 * 1000;
 const FETCH_TIMEOUT_MS = 60 * 1000;
+const TLS_INSECURE_SKIP_VERIFY = process.env.OAUTH_TLS_INSECURE_SKIP_VERIFY === '1';
+const TLS_CA_CERT_PATH = process.env.OAUTH_TLS_CA_CERT_PATH || '';
+
+let TLS_DISPATCHER;
+if (TLS_INSECURE_SKIP_VERIFY) {
+  TLS_DISPATCHER = new Agent({
+    connect: {
+      rejectUnauthorized: false,
+    },
+  });
+} else if (TLS_CA_CERT_PATH) {
+  try {
+    const ca = readFileSync(TLS_CA_CERT_PATH, 'utf8');
+    TLS_DISPATCHER = new Agent({
+      connect: {
+        ca,
+      },
+    });
+  } catch (error) {
+    console.warn(`[oauth-demo] failed to read OAUTH_TLS_CA_CERT_PATH: ${TLS_CA_CERT_PATH}`);
+    console.warn(`[oauth-demo] tls ca load error: ${String(error)}`);
+  }
+}
 
 function stripTrailingSlash(value) {
   return value.replace(/\/+$/, '');
@@ -107,9 +132,16 @@ async function fetchWithTimeout(input, init) {
   const timeoutId = setTimeout(() => controller.abort(new Error('timeout')), FETCH_TIMEOUT_MS);
 
   try {
-    return await fetch(input, {
+    const requestInit = {
       ...init,
       signal: controller.signal,
+    };
+    if (TLS_DISPATCHER) {
+      requestInit.dispatcher = TLS_DISPATCHER;
+    }
+
+    return await fetch(input, {
+      ...requestInit,
     });
   } finally {
     clearTimeout(timeoutId);
@@ -496,4 +528,9 @@ server.listen(PORT, HOST, () => {
   console.log(`[oauth-demo] auth base: ${AUTH_BASE}`);
   console.log(`[oauth-demo] iam token: ${IAM_TOKEN_URL}`);
   console.log(`[oauth-demo] redirect uri: ${REDIRECT_URI}`);
+  if (TLS_INSECURE_SKIP_VERIFY) {
+    console.warn('[oauth-demo] TLS certificate verification is DISABLED via OAUTH_TLS_INSECURE_SKIP_VERIFY=1');
+  } else if (TLS_CA_CERT_PATH) {
+    console.log(`[oauth-demo] using custom CA cert: ${TLS_CA_CERT_PATH}`);
+  }
 });
