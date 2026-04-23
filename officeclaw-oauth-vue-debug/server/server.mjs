@@ -7,7 +7,7 @@ const PORT = Number(process.env.DEMO_FLOW_PORT || 3008);
 const HOST = process.env.DEMO_FLOW_HOST || '127.0.0.1';
 
 const DEFAULT_IAM_BASE = 'https://sts-open.cn-north-7.myhuaweicloud.com';
-const DEFAULT_AUTH_BASE = 'https://auth.huaweicloud.com';
+const DEFAULT_AUTH_BASE = 'https://auth.ulanqab.huawei.com';
 const DEFAULT_HUAWEI_CLAW_BASE = 'https://versatile.cn-north-4.myhuaweicloud.com';
 
 const AUTH_BASE = stripTrailingSlash(process.env.OAUTH_AUTH_BASE || DEFAULT_AUTH_BASE);
@@ -165,26 +165,6 @@ async function exchangeToken({ code, state }) {
   const sessionUserId = claims.sub || `oauth-${base64Url(randomBytes(8))}`;
   const sessionUserName = claims.preferred_username || claims.name || sessionUserId;
 
-  const permissionUrl = `${HUAWEI_CLAW_BASE}/v1/claw/permission-validate`;
-  const permissionHeaders = {};
-  if (credential.securityToken) permissionHeaders['X-Security-Token'] = credential.securityToken;
-  if (credential.project_id) permissionHeaders['X-Project-ID'] = credential.project_id;
-
-  let permissionStatus = 0;
-  let permissionBody = null;
-  let permissionError = null;
-  try {
-    const permissionRes = await fetch(permissionUrl, { method: 'GET', headers: permissionHeaders });
-    permissionStatus = permissionRes.status;
-    try {
-      permissionBody = await permissionRes.json();
-    } catch {
-      permissionBody = await permissionRes.text().catch(() => '');
-    }
-  } catch (error) {
-    permissionError = String(error);
-  }
-
   sessions.set(sessionUserId, {
     userId: sessionUserId,
     userName: sessionUserName,
@@ -199,15 +179,52 @@ async function exchangeToken({ code, state }) {
       userId: sessionUserId,
       userName: sessionUserName,
       tokenEndpoint: IAM_TOKEN_URL,
-      permissionValidate: {
-        url: permissionUrl,
-        status: permissionStatus,
-        error: permissionError,
-        body: permissionBody,
-      },
       tokenResponse: tokenData,
     },
   };
+}
+
+async function validatePermission({ userId }) {
+  const session = sessions.get(userId);
+  if (!session) {
+    return { status: 404, data: { error: '找不到 session，请先完成登录' } };
+  }
+
+  const permissionUrl = `${HUAWEI_CLAW_BASE}/v1/claw/permission-validate`;
+  const permissionHeaders = {};
+  if (session.credential?.securityToken) permissionHeaders['X-Security-Token'] = session.credential.securityToken;
+  if (session.credential?.project_id) permissionHeaders['X-Project-ID'] = session.credential.project_id;
+
+  try {
+    const permissionRes = await fetch(permissionUrl, { method: 'GET', headers: permissionHeaders });
+    let permissionBody = null;
+    try {
+      permissionBody = await permissionRes.json();
+    } catch {
+      permissionBody = await permissionRes.text().catch(() => '');
+    }
+
+    return {
+      status: permissionRes.status,
+      data: {
+        success: permissionRes.ok,
+        userId,
+        url: permissionUrl,
+        status: permissionRes.status,
+        body: permissionBody,
+      },
+    };
+  } catch (error) {
+    return {
+      status: 500,
+      data: {
+        success: false,
+        userId,
+        url: permissionUrl,
+        error: String(error),
+      },
+    };
+  }
 }
 
 async function refreshToken({ userId }) {
@@ -362,7 +379,7 @@ const server = createServer(async (req, res) => {
     const oauthParams = new URLSearchParams({
       client_id: CLIENT_ID,
       code_challenge: codeChallenge,
-      code_challenge_method: 'S256',
+      code_challenge_method: 'SHA-256',
       state,
       scope: SCOPE,
       redirect_uri: REDIRECT_URI,
@@ -412,6 +429,22 @@ const server = createServer(async (req, res) => {
       json(res, result.status, result.data);
     } catch (error) {
       json(res, 500, { error: `refresh 异常: ${String(error)}` });
+    }
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/demo-api/flow/permission-validate') {
+    try {
+      const body = await readBody(req);
+      const userId = String(body.userId || '').trim();
+      if (!userId) {
+        json(res, 400, { error: 'userId 不能为空' });
+        return;
+      }
+      const result = await validatePermission({ userId });
+      json(res, result.status, result.data);
+    } catch (error) {
+      json(res, 500, { error: `permission-validate 异常: ${String(error)}` });
     }
     return;
   }

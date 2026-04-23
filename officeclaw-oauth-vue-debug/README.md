@@ -41,7 +41,7 @@ npm run dev
 - 授权成功后会跳到本地捕获页，点击“复制完整回调URL”，粘贴到 Step3 输入框解析
 - Step3 同样支持粘贴 `officeclaw://oauth/callback?...` 或普通 URL 回调地址自动提取参数
 - Step4 发起真实换 token 请求
-- Step5 自动展示 permission-validate 调用结果
+- Step5 由 Vue 主动调用后端 `/demo-api/flow/permission-validate` 并展示结果
 - Step6 用 refresh_token 发起刷新请求
 
 ## 注意

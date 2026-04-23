@@ -177,12 +177,30 @@ async function step4ExchangeToken(): Promise<void> {
 
     currentUserId.value = String(res.data.userId || '');
     currentUserName.value = String(res.data.userName || '');
-    permissionResult.value = (res.data.permissionValidate as ApiResponse | undefined) || null;
+    permissionResult.value = null;
     log(`换token成功: userId=${currentUserId.value || '(空)'}`);
+  });
+}
 
-    if (permissionResult.value) {
-      log(`permission-validate 已执行: status=${String(permissionResult.value.status || 'unknown')}`);
+async function step5ValidatePermission(): Promise<void> {
+  await withBusy('Step5 permission-validate', async () => {
+    if (!currentUserId.value.trim()) {
+      log('请先完成 Step4 获得 userId');
+      return;
     }
+
+    const res = await callApi('/flow/permission-validate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ userId: currentUserId.value.trim() }),
+    });
+
+    permissionResult.value = res.data;
+    if (!res.ok) {
+      log(`permission-validate 失败: ${res.status} ${String(res.data.error || '')}`);
+      return;
+    }
+    log(`permission-validate 完成: status=${String(res.data.status || res.status)}`);
   });
 }
 
@@ -300,7 +318,8 @@ onMounted(async () => {
     <section class="grid two">
       <article class="card">
         <h2>Step 5：调用 permission-validate</h2>
-        <p class="hint">Step4 成功后自动调用。这里展示调用结果。</p>
+        <p class="hint">由 Vue 主动调用后端接口。</p>
+        <button :disabled="busy || !hasTokenStepDone" @click="step5ValidatePermission">执行 Step5（permission-validate）</button>
         <pre>{{ permissionResult }}</pre>
       </article>
 
