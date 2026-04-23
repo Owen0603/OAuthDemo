@@ -163,12 +163,6 @@ async function generateDpopProof(method, url) {
 async function exchangeToken({ code, state }) {
   pruneExpiredStates();
   const pending = pendingStates.get(state);
-  if (!pending || pending.expiresAt < Date.now()) {
-    pendingStates.delete(state);
-    return { status: 400, data: { error: 'state 无效或已过期，请重新发起登录' } };
-  }
-  pendingStates.delete(state);
-
   const dpopProof = await generateDpopProof('POST', IAM_TOKEN_URL);
   const tokenBody = new URLSearchParams({
     client_id: CLIENT_ID,
