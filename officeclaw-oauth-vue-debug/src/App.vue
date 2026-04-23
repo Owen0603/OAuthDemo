@@ -260,22 +260,22 @@ async function step4ExchangeToken(): Promise<void> {
     }
 
     const dpopProof = await generateDpopProof('POST', config.value.iamTokenUrl);
-    const body = {
+    const body = new URLSearchParams({
       client_id: config.value.clientId,
       code: callbackCode.value.trim(),
       code_verifier: codeVerifier.value.trim(),
       grant_type: 'authorization_code',
       redirect_uri: config.value.redirectUri,
-    };
+    });
 
     const res = await callApiDirect(config.value.iamTokenUrl, {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/json',
+        'Content-Type': 'application/x-www-form-urlencoded',
         Accept: 'application/json',
         DPoP: dpopProof,
       },
-      body: JSON.stringify(body),
+      body: body.toString(),
     });
 
     tokenResult.value = {
@@ -362,20 +362,20 @@ async function step6RefreshToken(): Promise<void> {
     }
 
     const dpopProof = await generateDpopProof('POST', config.value.iamTokenUrl);
-    const body = {
+    const body = new URLSearchParams({
       client_id: config.value.clientId,
       grant_type: 'refresh_token',
       refresh_token: refreshTokenValue.value.trim(),
-    };
+    });
 
     const res = await callApiDirect(config.value.iamTokenUrl, {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/json',
+        'Content-Type': 'application/x-www-form-urlencoded',
         Accept: 'application/json',
         DPoP: dpopProof,
       },
-      body: JSON.stringify(body),
+      body: body.toString(),
     });
 
     refreshResult.value = {
