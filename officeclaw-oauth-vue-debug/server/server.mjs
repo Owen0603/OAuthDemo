@@ -1,7 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { createServer } from 'node:http';
 import { URL } from 'node:url';
-import { SignJWT, exportJWK, generateKeyPair } from 'jose';
 
 const PORT = Number(process.env.DEMO_FLOW_PORT || 3008);
 const HOST = process.env.DEMO_FLOW_HOST || '127.0.0.1';
@@ -20,15 +19,7 @@ const REDIRECT_URI = process.env.OAUTH_REDIRECT_URI || `http://${HOST}:${PORT}/d
 const SCOPE = 'openid';
 
 const pendingStates = new Map();
-const sessions = new Map();
 const STATE_TTL_MS = 10 * 60 * 1000;
-const FETCH_TIMEOUT_MS = 60 * 1000;
-const TLS_INSECURE_SKIP_VERIFY = process.env.OAUTH_TLS_INSECURE_SKIP_VERIFY !== '0';
-
-if (TLS_INSECURE_SKIP_VERIFY) {
-  // For this demo, disable TLS cert verification by default.
-  process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
-}
 
 function stripTrailingSlash(value) {
   return value.replace(/\/+$/, '');
@@ -91,237 +82,6 @@ function readBody(req) {
     });
     req.on('error', reject);
   });
-}
-
-function parseIdTokenClaims(idToken) {
-  try {
-    const parts = String(idToken || '').split('.');
-    if (parts.length < 2) return {};
-    const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
-    return {
-      sub: typeof payload.sub === 'string' ? payload.sub : undefined,
-      preferred_username: typeof payload.preferred_username === 'string' ? payload.preferred_username : undefined,
-      name: typeof payload.name === 'string' ? payload.name : undefined,
-    };
-  } catch {
-    return {};
-  }
-}
-
-async function fetchWithTimeout(input, init) {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(new Error('timeout')), FETCH_TIMEOUT_MS);
-
-  try {
-    return await fetch(input, {
-      ...init,
-      signal: controller.signal,
-    });
-  } finally {
-    clearTimeout(timeoutId);
-  }
-}
-
-async function generateDpopProof(method, url) {
-  const { privateKey, publicKey } = await generateKeyPair('ES256', { extractable: true });
-  const publicJwk = await exportJWK(publicKey);
-  const iat = Math.floor(Date.now() / 1000);
-  const jti = base64Url(randomBytes(16));
-  return new SignJWT({ htm: method.toUpperCase(), htu: url, jti })
-    .setProtectedHeader({ alg: 'ES256', typ: 'dpop+jwt', jwk: publicJwk })
-    .setIssuedAt(iat)
-    .setExpirationTime(iat + 120)
-    .sign(privateKey);
-}
-
-async function exchangeToken({ code, state }) {
-  pruneExpiredStates();
-  const pending = pendingStates.get(state);
-  const dpopProof = await generateDpopProof('POST', IAM_TOKEN_URL);
-  const tokenBody = new URLSearchParams({
-    client_id: CLIENT_ID,
-    code,
-    code_verifier: pending.codeVerifier,
-    grant_type: 'authorization_code',
-    redirect_uri: REDIRECT_URI,
-  });
-
-  let tokenRes;
-  try {
-    tokenRes = await fetchWithTimeout(IAM_TOKEN_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        Accept: 'application/json',
-        DPoP: dpopProof,
-      },
-      body: tokenBody.toString(),
-    });
-  } catch (error) {
-    return {
-      status: 504,
-      data: {
-        error: `授权码换 token 请求失败: ${String(error)}`,
-        tokenEndpoint: IAM_TOKEN_URL,
-      },
-    };
-  }
-
-  let tokenData = {};
-  try {
-    tokenData = await tokenRes.json();
-  } catch {
-    tokenData = { raw: await tokenRes.text().catch(() => '') };
-  }
-
-  if (!tokenRes.ok) {
-    return {
-      status: tokenRes.status,
-      data: {
-        error: '授权码换 token 失败',
-        tokenEndpoint: IAM_TOKEN_URL,
-        tokenResponse: tokenData,
-      },
-    };
-  }
-
-  const credential = tokenData.credential || {};
-  const claims = parseIdTokenClaims(tokenData.id_token);
-  const sessionUserId = claims.sub || `oauth-${base64Url(randomBytes(8))}`;
-  const sessionUserName = claims.preferred_username || claims.name || sessionUserId;
-
-  sessions.set(sessionUserId, {
-    userId: sessionUserId,
-    userName: sessionUserName,
-    refreshToken: tokenData.refresh_token || '',
-    credential,
-  });
-
-  return {
-    status: 200,
-    data: {
-      success: true,
-      userId: sessionUserId,
-      userName: sessionUserName,
-      tokenEndpoint: IAM_TOKEN_URL,
-      tokenResponse: tokenData,
-    },
-  };
-}
-
-async function validatePermission({ userId }) {
-  const session = sessions.get(userId);
-  if (!session) {
-    return { status: 404, data: { error: '找不到 session，请先完成登录' } };
-  }
-
-  const permissionUrl = `${HUAWEI_CLAW_BASE}/v1/claw/permission-validate`;
-  const permissionHeaders = { Accept: 'application/json' };
-  if (session.credential?.securityToken) permissionHeaders['X-Security-Token'] = session.credential.securityToken;
-  if (session.credential?.project_id) permissionHeaders['X-Project-ID'] = session.credential.project_id;
-
-  let permissionRes;
-  try {
-    permissionRes = await fetchWithTimeout(permissionUrl, { method: 'GET', headers: permissionHeaders });
-  } catch (error) {
-    return {
-      status: 504,
-      data: {
-        success: false,
-        userId,
-        url: permissionUrl,
-        error: String(error),
-      },
-    };
-  }
-
-  let permissionBody = null;
-  try {
-    permissionBody = await permissionRes.json();
-  } catch {
-    permissionBody = await permissionRes.text().catch(() => '');
-  }
-
-  return {
-    status: permissionRes.status,
-    data: {
-      success: permissionRes.ok,
-      userId,
-      url: permissionUrl,
-      status: permissionRes.status,
-      body: permissionBody,
-    },
-  };
-}
-
-async function refreshToken({ userId }) {
-  const session = sessions.get(userId);
-  if (!session) {
-    return { status: 404, data: { error: '找不到 session，请先完成登录' } };
-  }
-  if (!session.refreshToken) {
-    return { status: 400, data: { error: '当前 session 无 refresh_token' } };
-  }
-
-  const dpopProof = await generateDpopProof('POST', IAM_TOKEN_URL);
-  const tokenBody = new URLSearchParams({
-    client_id: CLIENT_ID,
-    grant_type: 'refresh_token',
-    refresh_token: session.refreshToken,
-  });
-
-  let tokenRes;
-  try {
-    tokenRes = await fetchWithTimeout(IAM_TOKEN_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        Accept: 'application/json',
-        DPoP: dpopProof,
-      },
-      body: tokenBody.toString(),
-    });
-  } catch (error) {
-    return {
-      status: 504,
-      data: {
-        error: `刷新 token 请求失败: ${String(error)}`,
-        tokenEndpoint: IAM_TOKEN_URL,
-      },
-    };
-  }
-
-  let tokenData = {};
-  try {
-    tokenData = await tokenRes.json();
-  } catch {
-    tokenData = { raw: await tokenRes.text().catch(() => '') };
-  }
-
-  if (!tokenRes.ok) {
-    return {
-      status: tokenRes.status,
-      data: {
-        error: '刷新 token 失败',
-        tokenEndpoint: IAM_TOKEN_URL,
-        tokenResponse: tokenData,
-      },
-    };
-  }
-
-  session.credential = tokenData.credential || session.credential;
-  if (tokenData.refresh_token) session.refreshToken = tokenData.refresh_token;
-  sessions.set(userId, session);
-
-  return {
-    status: 200,
-    data: {
-      success: true,
-      userId,
-      tokenEndpoint: IAM_TOKEN_URL,
-      tokenResponse: tokenData,
-    },
-  };
 }
 
 
@@ -439,55 +199,6 @@ const server = createServer(async (req, res) => {
     return;
   }
 
-  if (req.method === 'POST' && url.pathname === '/demo-api/flow/exchange') {
-    try {
-      const body = await readBody(req);
-      const code = String(body.code || '').trim();
-      const state = String(body.state || '').trim();
-      if (!code || !state) {
-        json(res, 400, { error: 'code/state 不能为空' });
-        return;
-      }
-      const result = await exchangeToken({ code, state });
-      json(res, result.status, result.data);
-    } catch (error) {
-      json(res, 500, { error: `exchange 异常: ${String(error)}` });
-    }
-    return;
-  }
-
-  if (req.method === 'POST' && url.pathname === '/demo-api/flow/permission-validate') {
-    try {
-      const body = await readBody(req);
-      const userId = String(body.userId || '').trim();
-      if (!userId) {
-        json(res, 400, { error: 'userId 不能为空' });
-        return;
-      }
-      const result = await validatePermission({ userId });
-      json(res, result.status, result.data);
-    } catch (error) {
-      json(res, 500, { error: `permission-validate 异常: ${String(error)}` });
-    }
-    return;
-  }
-
-  if (req.method === 'POST' && url.pathname === '/demo-api/flow/refresh') {
-    try {
-      const body = await readBody(req);
-      const userId = String(body.userId || '').trim();
-      if (!userId) {
-        json(res, 400, { error: 'userId 不能为空' });
-        return;
-      }
-      const result = await refreshToken({ userId });
-      json(res, result.status, result.data);
-    } catch (error) {
-      json(res, 500, { error: `refresh 异常: ${String(error)}` });
-    }
-    return;
-  }
-
   json(res, 404, { error: 'Not Found' });
 });
 
@@ -496,7 +207,4 @@ server.listen(PORT, HOST, () => {
   console.log(`[oauth-demo] auth base: ${AUTH_BASE}`);
   console.log(`[oauth-demo] iam token: ${IAM_TOKEN_URL}`);
   console.log(`[oauth-demo] redirect uri: ${REDIRECT_URI}`);
-  if (TLS_INSECURE_SKIP_VERIFY) {
-    console.warn('[oauth-demo] TLS certificate verification is DISABLED (default). Set OAUTH_TLS_INSECURE_SKIP_VERIFY=0 to enable verification.');
-  }
 });

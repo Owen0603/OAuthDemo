@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue';
+import { SignJWT, exportJWK, generateKeyPair } from 'jose';
 
 type FlowConfig = {
   authBase: string;
@@ -52,6 +53,52 @@ function apiUrl(path: string): string {
   return `${base}${path}`;
 }
 
+function toBase64Url(input: Uint8Array): string {
+  let binary = '';
+  for (let i = 0; i < input.length; i += 1) {
+    binary += String.fromCharCode(input[i]);
+  }
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+function randomBase64Url(bytes = 16): string {
+  const data = new Uint8Array(bytes);
+  crypto.getRandomValues(data);
+  return toBase64Url(data);
+}
+
+function parseJwtPayload(token: string): Record<string, unknown> {
+  const parts = token.split('.');
+  if (parts.length < 2) return {};
+  const b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+  const pad = '='.repeat((4 - (b64.length % 4)) % 4);
+  const json = atob(b64 + pad);
+  return JSON.parse(json) as Record<string, unknown>;
+}
+
+async function generateDpopProof(method: string, url: string): Promise<string> {
+  const { privateKey, publicKey } = await generateKeyPair('ES256', { extractable: true });
+  const publicJwk = await exportJWK(publicKey);
+  const iat = Math.floor(Date.now() / 1000);
+  const jti = randomBase64Url(16);
+  return new SignJWT({ htm: method.toUpperCase(), htu: url, jti })
+    .setProtectedHeader({ alg: 'ES256', typ: 'dpop+jwt', jwk: publicJwk })
+    .setIssuedAt(iat)
+    .setExpirationTime(iat + 120)
+    .sign(privateKey);
+}
+
+function proxyIamTokenUrl(): string {
+  const endpoint = String(config.value?.iamTokenUrl || '').trim();
+  if (!endpoint) return '/proxy/iam/v1/oauth2/tokens';
+  const url = new URL(endpoint);
+  return `/proxy/iam${url.pathname}${url.search}`;
+}
+
+function permissionValidateUrl(): string {
+  return '/proxy/claw/v1/claw/permission-validate';
+}
+
 async function fetchWithTimeout(input: string, init?: RequestInit): Promise<Response> {
   const controller = new AbortController();
   const timeoutId = window.setTimeout(() => controller.abort(new Error('timeout')), FETCH_TIMEOUT_MS);
@@ -87,6 +134,23 @@ async function callApi(path: string, init?: RequestInit): Promise<{ ok: boolean;
     data = (await res.json()) as ApiResponse;
   } catch {
     data = { error: '非 JSON 响应' };
+  }
+  return { ok: res.ok, status: res.status, data };
+}
+
+async function callApiDirect(url: string, init?: RequestInit): Promise<{ ok: boolean; status: number; data: ApiResponse }> {
+  let res: Response;
+  try {
+    res = await fetchWithTimeout(url, init);
+  } catch (error) {
+    return { ok: false, status: 0, data: { error: `请求失败: ${String(error)}`, url } };
+  }
+
+  let data: ApiResponse = {};
+  try {
+    data = (await res.json()) as ApiResponse;
+  } catch {
+    data = { raw: await res.text().catch(() => '') };
   }
   return { ok: res.ok, status: res.status, data };
 }
@@ -194,29 +258,50 @@ async function step4ExchangeToken(): Promise<void> {
       log('警告：回调 state 与 Step1 生成 state 不一致，请确认登录流程是否被打断');
     }
 
-    const res = await callApi('/flow/exchange', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-      },
-      body: JSON.stringify({
-        code: callbackCode.value.trim(),
-        state: callbackState.value.trim(),
-      }),
+    if (!config.value?.iamTokenUrl) {
+      log('缺少 iamTokenUrl 配置，请先刷新页面加载配置');
+      return;
+    }
+
+    const tokenEndpoint = config.value.iamTokenUrl;
+    const dpopProof = await generateDpopProof('POST', tokenEndpoint);
+    const body = new URLSearchParams({
+      client_id: String(config.value.clientId || ''),
+      code: callbackCode.value.trim(),
+      code_verifier: codeVerifier.value.trim(),
+      grant_type: 'authorization_code',
+      redirect_uri: String(config.value.redirectUri || ''),
     });
 
-    tokenResult.value = res.data;
+    const res = await callApiDirect(proxyIamTokenUrl(), {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Accept: 'application/json',
+        DPoP: dpopProof,
+      },
+      body: body.toString(),
+    });
+
+    tokenResult.value = {
+      success: res.ok,
+      tokenEndpoint,
+      tokenResponse: res.data,
+    };
     if (!res.ok) {
       log(`换token失败: ${res.status}`);
       return;
     }
 
-    const tokenData = (res.data.tokenResponse as ApiResponse | undefined) || {};
+    const tokenData = res.data;
     credential.value = (tokenData.credential as ApiResponse | undefined) || null;
     refreshTokenValue.value = String(tokenData.refresh_token || '');
-    currentUserId.value = String(res.data.userId || '');
-    currentUserName.value = String(res.data.userName || '');
+    const claims = parseJwtPayload(String(tokenData.id_token || ''));
+    const sub = String(claims.sub || '').trim();
+    const preferred = String(claims.preferred_username || '').trim();
+    const name = String(claims.name || '').trim();
+    currentUserId.value = sub || `oauth-${Date.now()}`;
+    currentUserName.value = preferred || name || currentUserId.value;
     permissionResult.value = null;
     log(`换token成功: userId=${currentUserId.value || '(空)'}`);
   });
@@ -229,21 +314,32 @@ async function step5ValidatePermission(): Promise<void> {
       return;
     }
 
-    const res = await callApi('/flow/permission-validate', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-      },
-      body: JSON.stringify({ userId: currentUserId.value.trim() }),
+    const headers: Record<string, string> = {
+      Accept: 'application/json',
+    };
+    const securityToken = String(credential.value.securityToken || '').trim();
+    const projectId = String(credential.value.project_id || '').trim();
+    if (securityToken) headers['X-Security-Token'] = securityToken;
+    if (projectId) headers['X-Project-ID'] = projectId;
+
+    const url = permissionValidateUrl();
+    const res = await callApiDirect(url, {
+      method: 'GET',
+      headers,
     });
 
-    permissionResult.value = res.data;
+    permissionResult.value = {
+      success: res.ok,
+      userId: currentUserId.value.trim(),
+      url,
+      status: res.status,
+      body: res.data,
+    };
     if (!res.ok) {
       log(`permission-validate 失败: ${res.status}`);
       return;
     }
-    log(`permission-validate 完成: status=${String(res.data.status || res.status)}`);
+    log(`permission-validate 完成: status=${String(res.status)}`);
   });
 }
 
@@ -259,22 +355,41 @@ async function step6RefreshToken(): Promise<void> {
       return;
     }
 
-    const res = await callApi('/flow/refresh', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-      },
-      body: JSON.stringify({ userId: currentUserId.value.trim() }),
+    if (!config.value?.iamTokenUrl) {
+      log('缺少 iamTokenUrl 配置，请先刷新页面加载配置');
+      return;
+    }
+
+    const tokenEndpoint = config.value.iamTokenUrl;
+    const dpopProof = await generateDpopProof('POST', tokenEndpoint);
+    const body = new URLSearchParams({
+      client_id: String(config.value.clientId || ''),
+      grant_type: 'refresh_token',
+      refresh_token: refreshTokenValue.value.trim(),
     });
 
-    refreshResult.value = res.data;
+    const res = await callApiDirect(proxyIamTokenUrl(), {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Accept: 'application/json',
+        DPoP: dpopProof,
+      },
+      body: body.toString(),
+    });
+
+    refreshResult.value = {
+      success: res.ok,
+      userId: currentUserId.value.trim(),
+      tokenEndpoint,
+      tokenResponse: res.data,
+    };
     if (!res.ok) {
       log(`刷新token失败: ${res.status}`);
       return;
     }
 
-    const tokenData = (res.data.tokenResponse as ApiResponse | undefined) || {};
+    const tokenData = res.data;
     const nextCredential = (tokenData.credential as ApiResponse | undefined) || null;
     if (nextCredential) credential.value = nextCredential;
     if (String(tokenData.refresh_token || '').trim()) {
