@@ -1,11 +1,13 @@
 import { createHash, randomBytes } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { URL } from 'node:url';
+import { Agent } from 'undici';
 
 const PORT = Number(process.env.DEMO_FLOW_PORT || 3008);
 const HOST = process.env.DEMO_FLOW_HOST || '127.0.0.1';
 
-const DEFAULT_IAM_BASE = 'https://sts-open.cn-north-7.myhuaweicloud.com';
+const DEFAULT_IAM_BASE = 'https://sts.cn-north-7.myhuaweicloud.com';
 const DEFAULT_AUTH_BASE = 'https://auth.ulanqab.huawei.com';
 const DEFAULT_HUAWEI_CLAW_BASE = 'https://versatile.cn-north-4.myhuaweicloud.com';
 
@@ -17,9 +19,14 @@ const IAM_TOKEN_URL = `${IAM_STS_BASE}/v1/oauth2/tokens`;
 const CLIENT_ID = process.env.OAUTH_CLIENT_ID || 'client-officeclaw';
 const REDIRECT_URI = process.env.OAUTH_REDIRECT_URI || `http://${HOST}:${PORT}/demo-callback`;
 const SCOPE = 'openid';
+const TLS_INSECURE = process.env.OAUTH_TLS_INSECURE === 'true';
+const TLS_CA_CERT_FILE = String(process.env.OAUTH_CA_CERT_FILE || '').trim();
 
 const pendingStates = new Map();
 const STATE_TTL_MS = 10 * 60 * 1000;
+
+const CUSTOM_CA_CERT = TLS_CA_CERT_FILE ? readFileSync(TLS_CA_CERT_FILE, 'utf8') : '';
+const FETCH_DISPATCHER = createFetchDispatcher();
 
 function stripTrailingSlash(value) {
   return value.replace(/\/+$/, '');
@@ -55,6 +62,38 @@ function json(res, status, data) {
     'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
   });
   res.end(payload);
+}
+
+function createFetchDispatcher() {
+  if (TLS_INSECURE) {
+    return new Agent({
+      connect: {
+        rejectUnauthorized: false,
+      },
+    });
+  }
+
+  if (CUSTOM_CA_CERT) {
+    return new Agent({
+      connect: {
+        ca: CUSTOM_CA_CERT,
+      },
+    });
+  }
+
+  return undefined;
+}
+
+function buildFetchErrorPayload(error) {
+  const message = String(error);
+  if (/unable to verify the first certificate/i.test(message)) {
+    return {
+      error: message,
+      diagnosis: 'Node 当前不信任公司内部证书链。优先把公司根证书或中间证书导出成 PEM，并设置 OAUTH_CA_CERT_FILE=/绝对路径/ca.pem；只在本地临时调试时再考虑 OAUTH_TLS_INSECURE=true。',
+    };
+  }
+
+  return { error: message };
 }
 
 function sanitizeProxyHeaders(headers) {
@@ -244,6 +283,7 @@ const server = createServer(async (req, res) => {
         method,
         headers,
         body: ['GET', 'HEAD'].includes(method) ? undefined : body,
+        dispatcher: FETCH_DISPATCHER,
       });
       const upstreamHeaders = Object.fromEntries(upstream.headers.entries());
       const upstreamBody = await readResponseBody(upstream);
@@ -265,6 +305,7 @@ const server = createServer(async (req, res) => {
         },
       });
     } catch (error) {
+      const errorPayload = buildFetchErrorPayload(error);
       json(res, 502, {
         success: false,
         request: {
@@ -274,7 +315,7 @@ const server = createServer(async (req, res) => {
           body: ['GET', 'HEAD'].includes(method) ? '' : body,
           via: 'server.mjs',
         },
-        error: String(error),
+        ...errorPayload,
       });
     }
     return;
@@ -288,4 +329,10 @@ server.listen(PORT, HOST, () => {
   console.log(`[oauth-demo] auth base: ${AUTH_BASE}`);
   console.log(`[oauth-demo] iam token: ${IAM_TOKEN_URL}`);
   console.log(`[oauth-demo] redirect uri: ${REDIRECT_URI}`);
+  if (TLS_CA_CERT_FILE) {
+    console.log(`[oauth-demo] tls ca file: ${TLS_CA_CERT_FILE}`);
+  }
+  if (TLS_INSECURE) {
+    console.log('[oauth-demo] tls verify disabled: OAUTH_TLS_INSECURE=true');
+  }
 });

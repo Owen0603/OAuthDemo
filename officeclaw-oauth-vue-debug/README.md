@@ -32,6 +32,22 @@ npm run dev
 
 默认地址：`http://127.0.0.1:5173`
 
+### 内网证书问题
+
+如果公司内网环境下调用 HTTPS 接口报 `unable to verify the first certificate`，说明本机 Node 进程不信任目标服务返回的证书链。
+
+优先方案：给 Node 指定公司 CA 证书
+
+```bash
+OAUTH_CA_CERT_FILE=/absolute/path/company-ca.pem npm run dev
+```
+
+临时调试方案：关闭 server.mjs 的 TLS 校验（仅限本地调试，不要带到正式环境）
+
+```bash
+OAUTH_TLS_INSECURE=true npm run dev
+```
+
 ## 使用说明
 
 - 页面会展示真实默认地址：`AUTH_BASE` / `IAM_TOKEN_URL` / `HUAWEI_CLAW_BASE` / `CLIENT_ID` / `REDIRECT_URI`

@@ -5,7 +5,7 @@ export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '');
   const apiTarget = env.VITE_API_TARGET || 'http://127.0.0.1:3004';
   const demoFlowApiTarget = env.VITE_DEMO_FLOW_API_TARGET || 'http://127.0.0.1:3008';
-  const iamProxyTarget = env.VITE_IAM_PROXY_TARGET || 'https://sts-open.cn-north-7.myhuaweicloud.com';
+  const iamProxyTarget = env.VITE_IAM_PROXY_TARGET || 'https://sts.cn-north-7.myhuaweicloud.com';
   const clawProxyTarget = env.VITE_CLAW_PROXY_TARGET || 'https://versatile.cn-north-4.myhuaweicloud.com';
 
   return {
