@@ -17,6 +17,7 @@ const flowApiBase = ref('/demo-api');
 const busy = ref(false);
 const logs = ref<string[]>([]);
 const FETCH_TIMEOUT_MS = 60 * 1000;
+const currentPath = ref(window.location.pathname || '/');
 
 const config = ref<FlowConfig | null>(null);
 
@@ -30,15 +31,53 @@ const callbackState = ref('');
 const callbackError = ref('');
 
 const tokenResult = ref<ApiResponse | null>(null);
+const directTokenResult = ref<ApiResponse | null>(null);
 const permissionResult = ref<ApiResponse | null>(null);
 const refreshResult = ref<ApiResponse | null>(null);
 const credential = ref<ApiResponse | null>(null);
 const refreshTokenValue = ref('');
+const directCallIncludeDpop = ref(true);
+const testMethod = ref('POST');
+const testUrl = ref('');
+const testHeadersText = ref('Accept: application/json\nContent-Type: application/x-www-form-urlencoded');
+const testBody = ref('');
+const testUseCredentials = ref(false);
+const testResult = ref<ApiResponse | null>(null);
 
 const currentUserId = ref('');
 const currentUserName = ref('');
 
 const hasTokenStepDone = computed(() => Boolean(tokenResult.value && currentUserId.value));
+const isTestRoute = computed(() => currentPath.value === '/test');
+const testCurlCommand = computed(() => {
+  const url = testUrl.value.trim();
+  if (!url) return 'curl';
+
+  const method = testMethod.value.toUpperCase();
+  let headers: Record<string, string> = {};
+  try {
+    headers = parseHeadersText(testHeadersText.value);
+  } catch {
+    return 'Header 格式错误，暂时无法生成 curl';
+  }
+
+  const parts = ['curl'];
+  if (method !== 'GET') {
+    parts.push(`-X ${shellEscape(method)}`);
+  }
+  for (const [name, value] of Object.entries(headers)) {
+    parts.push(`-H ${shellEscape(`${name}: ${value}`)}`);
+  }
+  if (testUseCredentials.value) {
+    parts.push('--cookie-jar cookies.txt');
+    parts.push('--cookie cookies.txt');
+  }
+  if (shouldAttachBody(method) && testBody.value) {
+    parts.push(`--data ${shellEscape(testBody.value)}`);
+  }
+  parts.push(shellEscape(url));
+  return parts.join(' \\\n+  ');
+});
 
 function now(): string {
   return new Date().toLocaleTimeString('zh-CN', { hour12: false });
@@ -51,6 +90,19 @@ function log(message: string): void {
 function apiUrl(path: string): string {
   const base = flowApiBase.value.trim().replace(/\/+$/, '');
   return `${base}${path}`;
+}
+
+function navigateTo(path: string): void {
+  if (window.location.pathname === path) {
+    currentPath.value = path;
+    return;
+  }
+  window.history.pushState({}, '', path);
+  currentPath.value = path;
+}
+
+function shellEscape(value: string): string {
+  return `'${value.replace(/'/g, `'"'"'`)}'`;
 }
 
 function toBase64Url(input: Uint8Array): string {
@@ -153,6 +205,162 @@ async function callApiDirect(url: string, init?: RequestInit): Promise<{ ok: boo
     data = { raw: await res.text().catch(() => '') };
   }
   return { ok: res.ok, status: res.status, data };
+}
+
+function buildTokenRequestBody(grantType: 'authorization_code' | 'refresh_token'): URLSearchParams {
+  if (grantType === 'refresh_token') {
+    return new URLSearchParams({
+      client_id: String(config.value?.clientId || ''),
+      grant_type: 'refresh_token',
+      refresh_token: refreshTokenValue.value.trim(),
+    });
+  }
+
+  return new URLSearchParams({
+    client_id: String(config.value?.clientId || ''),
+    code: callbackCode.value.trim(),
+    code_verifier: codeVerifier.value.trim(),
+    grant_type: 'authorization_code',
+    redirect_uri: String(config.value?.redirectUri || ''),
+  });
+}
+
+function guessDirectCallIssue(error: unknown, includeDpop: boolean): string {
+  const text = String(error || '');
+  if (/TypeError: Failed to fetch|Load failed|NetworkError|Network request failed/i.test(text)) {
+    return includeDpop
+      ? '浏览器直连通常会先发 CORS 预检；当前请求带了 DPoP 自定义请求头，服务端若未放行 OPTIONS 或 Access-Control-Allow-Headers 里未包含 DPoP，浏览器会直接拦截。'
+      : '浏览器直连失败且没有拿到 HTTP 响应，通常是目标接口未返回允许当前来源的 CORS 头，或 TLS / 网络层被浏览器拦截。';
+  }
+  return '浏览器已发起请求，但失败原因需要结合 DevTools Network 查看预检 OPTIONS 和实际 POST。';
+}
+
+function parseHeadersText(source: string): Record<string, string> {
+  const headers: Record<string, string> = {};
+  for (const line of source.split('\n')) {
+    const text = line.trim();
+    if (!text) continue;
+    const separatorIndex = text.indexOf(':');
+    if (separatorIndex === -1) {
+      throw new Error(`Header 格式错误: ${text}`);
+    }
+    const name = text.slice(0, separatorIndex).trim();
+    const value = text.slice(separatorIndex + 1).trim();
+    if (!name) {
+      throw new Error(`Header 名为空: ${text}`);
+    }
+    headers[name] = value;
+  }
+  return headers;
+}
+
+function shouldAttachBody(method: string): boolean {
+  return !['GET', 'HEAD'].includes(method.toUpperCase());
+}
+
+async function runTestRequest(): Promise<void> {
+  await withBusy('Test 路由直接调用', async () => {
+    const url = testUrl.value.trim();
+    if (!url) {
+      log('Test 路由缺少 URL');
+      return;
+    }
+
+    let headers: Record<string, string>;
+    try {
+      headers = parseHeadersText(testHeadersText.value);
+    } catch (error) {
+      testResult.value = {
+        success: false,
+        error: String(error),
+      };
+      log(`Test Header 解析失败: ${String(error)}`);
+      return;
+    }
+
+    const method = testMethod.value.toUpperCase();
+    try {
+      const response = await fetchWithTimeout(url, {
+        method,
+        headers,
+        body: shouldAttachBody(method) ? testBody.value : undefined,
+        credentials: testUseCredentials.value ? 'include' : 'same-origin',
+      });
+      const responseText = await response.text();
+      const responseHeaders = Object.fromEntries(response.headers.entries());
+      let responseBody: ApiResponse | string = responseText;
+      try {
+        responseBody = responseText ? (JSON.parse(responseText) as ApiResponse) : {};
+      } catch {
+        responseBody = responseText;
+      }
+
+      testResult.value = {
+        success: response.ok,
+        request: {
+          url,
+          method,
+          headers,
+          body: shouldAttachBody(method) ? testBody.value : '',
+          credentials: testUseCredentials.value ? 'include' : 'same-origin',
+        },
+        response: {
+          status: response.status,
+          statusText: response.statusText,
+          headers: responseHeaders,
+          body: responseBody,
+        },
+      };
+      log(`Test 路由调用完成: status=${response.status}`);
+    } catch (error) {
+      testResult.value = {
+        success: false,
+        request: {
+          url,
+          method,
+          headers,
+          body: shouldAttachBody(method) ? testBody.value : '',
+          credentials: testUseCredentials.value ? 'include' : 'same-origin',
+        },
+        error: String(error),
+        diagnosis: '浏览器未拿到响应时，优先检查 CORS、预检 OPTIONS、证书、网络代理和目标域名白名单。',
+      };
+      log(`Test 路由调用失败: ${String(error)}`);
+    }
+  });
+}
+
+function fillIamTokenTemplate(): void {
+  testMethod.value = 'POST';
+  testUrl.value = String(config.value?.iamTokenUrl || '');
+  testHeadersText.value = 'Accept: application/json\nContent-Type: application/x-www-form-urlencoded';
+  testBody.value = buildTokenRequestBody('authorization_code').toString();
+  testUseCredentials.value = false;
+  log('已用当前 IAM_TOKEN_URL 和 Step4 参数填充 test 表单');
+}
+
+async function appendTestDpopHeader(): Promise<void> {
+  const url = testUrl.value.trim();
+  if (!url) {
+    log('请先填写 Test URL，再生成 DPoP');
+    return;
+  }
+
+  const method = testMethod.value.toUpperCase();
+  const dpop = await generateDpopProof(method, url);
+  let headers: Record<string, string>;
+  try {
+    headers = parseHeadersText(testHeadersText.value);
+  } catch (error) {
+    log(`当前 Header 无法解析，未写入 DPoP: ${String(error)}`);
+    return;
+  }
+
+  headers.DPoP = dpop;
+  testHeadersText.value = Object.entries(headers)
+    .map(([name, value]) => `${name}: ${value}`)
+    .join('\n');
+  log(`已为 Test 请求写入 DPoP 头: method=${method}`);
 }
 
 async function withBusy(title: string, fn: () => Promise<void>) {
@@ -265,13 +473,7 @@ async function step4ExchangeToken(): Promise<void> {
 
     const tokenEndpoint = config.value.iamTokenUrl;
     const dpopProof = await generateDpopProof('POST', tokenEndpoint);
-    const body = new URLSearchParams({
-      client_id: String(config.value.clientId || ''),
-      code: callbackCode.value.trim(),
-      code_verifier: codeVerifier.value.trim(),
-      grant_type: 'authorization_code',
-      redirect_uri: String(config.value.redirectUri || ''),
-    });
+    const body = buildTokenRequestBody('authorization_code');
 
     const res = await callApiDirect(proxyIamTokenUrl(), {
       method: 'POST',
@@ -304,6 +506,78 @@ async function step4ExchangeToken(): Promise<void> {
     currentUserName.value = preferred || name || currentUserId.value;
     permissionResult.value = null;
     log(`换token成功: userId=${currentUserId.value || '(空)'}`);
+  });
+}
+
+async function step4DirectExchangeToken(): Promise<void> {
+  await withBusy('Step4 浏览器直连 IAM_TOKEN_URL', async () => {
+    if (callbackError.value.trim()) {
+      log(`回调包含 error: ${callbackError.value}`);
+      return;
+    }
+    if (!callbackCode.value.trim() || !callbackState.value.trim()) {
+      log('请先准备 code 和 state');
+      return;
+    }
+    if (!config.value?.iamTokenUrl) {
+      log('缺少 iamTokenUrl 配置，请先刷新页面加载配置');
+      return;
+    }
+
+    const tokenEndpoint = config.value.iamTokenUrl;
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      Accept: 'application/json',
+    };
+    if (directCallIncludeDpop.value) {
+      headers.DPoP = await generateDpopProof('POST', tokenEndpoint);
+    }
+
+    const body = buildTokenRequestBody('authorization_code');
+    try {
+      const response = await fetchWithTimeout(tokenEndpoint, {
+        method: 'POST',
+        headers,
+        body: body.toString(),
+      });
+
+      const responseText = await response.text();
+      let parsedBody: ApiResponse | string = responseText;
+      try {
+        parsedBody = responseText ? (JSON.parse(responseText) as ApiResponse) : {};
+      } catch {
+        parsedBody = responseText;
+      }
+
+      directTokenResult.value = {
+        success: response.ok,
+        status: response.status,
+        statusText: response.statusText,
+        request: {
+          url: tokenEndpoint,
+          method: 'POST',
+          includeDpop: directCallIncludeDpop.value,
+          headers,
+          body: body.toString(),
+        },
+        response: parsedBody,
+      };
+      log(`浏览器直连 IAM 完成: status=${response.status}`);
+    } catch (error) {
+      directTokenResult.value = {
+        success: false,
+        request: {
+          url: tokenEndpoint,
+          method: 'POST',
+          includeDpop: directCallIncludeDpop.value,
+          headers,
+          body: body.toString(),
+        },
+        error: String(error),
+        diagnosis: guessDirectCallIssue(error, directCallIncludeDpop.value),
+      };
+      log(`浏览器直连 IAM 失败: ${String(error)}`);
+    }
   });
 }
 
@@ -401,6 +675,9 @@ async function step6RefreshToken(): Promise<void> {
 
 onMounted(async () => {
   await loadConfig();
+  if (!testUrl.value.trim()) {
+    testUrl.value = String(config.value?.iamTokenUrl || '');
+  }
 
   const current = new URL(window.location.href);
   const code = (current.searchParams.get('code') || '').trim();
@@ -412,16 +689,23 @@ onMounted(async () => {
     callbackError.value = err;
     log('检测到浏览器 URL 中包含回调参数');
   }
+
+  window.addEventListener('popstate', () => {
+    currentPath.value = window.location.pathname || '/';
+  });
 });
 </script>
 
 <template>
-  <main class="page">
+  <main v-if="!isTestRoute" class="page">
     <header class="header card">
       <h1>OAuth 完整登录流 Demo（真实地址版）</h1>
       <p>
         按你要求的 6 步执行：PKCE 生成 -> 点击登录跳转授权页 -> 回调取 code -> code 换 token -> permission-validate -> refresh token。
       </p>
+      <div class="row">
+        <button :disabled="busy" @click="navigateTo('/test')">打开 Test 路由</button>
+      </div>
       <label>Flow API Base</label>
       <input v-model="flowApiBase" :disabled="busy" />
     </header>
@@ -476,6 +760,19 @@ onMounted(async () => {
       </article>
     </section>
 
+    <section class="card">
+      <h2>IAM_TOKEN_URL 直连调试</h2>
+      <p class="hint">这个按钮会让浏览器直接 POST 到当前配置里的 IAM_TOKEN_URL，不经过 Vite 代理，可用于判断是不是浏览器侧 CORS / 预检问题。</p>
+      <label class="checkbox">
+        <input v-model="directCallIncludeDpop" :disabled="busy" type="checkbox" />
+        <span>带上 DPoP 请求头一起直连</span>
+      </label>
+      <div class="row">
+        <button :disabled="busy" @click="step4DirectExchangeToken">直接调用 IAM_TOKEN_URL</button>
+      </div>
+      <pre>{{ directTokenResult }}</pre>
+    </section>
+
     <section class="grid two">
       <article class="card">
         <h2>Step 5：调用 permission-validate</h2>
@@ -493,6 +790,81 @@ onMounted(async () => {
         <button :disabled="busy || !hasTokenStepDone" @click="step6RefreshToken">执行 Step6（refresh）</button>
         <pre>{{ refreshResult }}</pre>
       </article>
+    </section>
+
+    <section class="card">
+      <h2>执行日志</h2>
+      <button :disabled="busy" @click="logs = []">清空</button>
+      <ul>
+        <li v-for="line in logs" :key="line">{{ line }}</li>
+      </ul>
+    </section>
+  </main>
+
+  <main v-else class="page page-test">
+    <header class="header card">
+      <h1>接口直调 Test 路由</h1>
+      <p>这个页面只做一件事：在浏览器里按你填写的 URL、Header、Body 原样发请求，方便确认是不是浏览器环境导致失败。</p>
+      <div class="row">
+        <button :disabled="busy" @click="navigateTo('/')">返回 OAuth Demo</button>
+        <button :disabled="busy" @click="fillIamTokenTemplate">填充 IAM_TOKEN_URL 模板</button>
+        <button :disabled="busy" @click="appendTestDpopHeader">生成 DPoP Header</button>
+      </div>
+    </header>
+
+    <section class="grid two">
+      <article class="card">
+        <h2>请求配置</h2>
+        <label>Method</label>
+        <select v-model="testMethod" :disabled="busy">
+          <option>GET</option>
+          <option>POST</option>
+          <option>PUT</option>
+          <option>PATCH</option>
+          <option>DELETE</option>
+          <option>OPTIONS</option>
+        </select>
+        <label>URL</label>
+        <input v-model="testUrl" :disabled="busy" placeholder="https://example.com/path" />
+        <label>Headers</label>
+        <textarea
+          v-model="testHeadersText"
+          :disabled="busy"
+          rows="8"
+          placeholder="Accept: application/json&#10;Content-Type: application/x-www-form-urlencoded"
+        />
+        <label>Body</label>
+        <textarea
+          v-model="testBody"
+          :disabled="busy"
+          rows="8"
+          placeholder="grant_type=authorization_code&client_id=..."
+        />
+        <label class="checkbox">
+          <input v-model="testUseCredentials" :disabled="busy" type="checkbox" />
+          <span>携带 credentials=include</span>
+        </label>
+        <div class="row">
+          <button :disabled="busy" @click="runTestRequest">直接调用</button>
+        </div>
+      </article>
+
+      <article class="card">
+        <h2>当前项目配置</h2>
+        <pre>{{ config }}</pre>
+        <p class="hint">如果你想复现 IAM_TOKEN_URL 问题，先走主页的 Step1-Step3，再点“填充 IAM_TOKEN_URL 模板”。</p>
+      </article>
+    </section>
+
+    <section class="card">
+      <h2>调用结果</h2>
+      <pre>{{ testResult }}</pre>
+    </section>
+
+    <section class="card">
+      <h2>curl 预览</h2>
+      <p class="hint">这个命令会按当前表单内容生成，方便你和 Postman 或终端请求逐项对比。</p>
+      <pre>{{ testCurlCommand }}</pre>
     </section>
 
     <section class="card">
@@ -553,6 +925,7 @@ label {
 }
 
 input,
+select,
 textarea,
 pre {
   width: 100%;
@@ -597,6 +970,17 @@ button:disabled {
   margin: 0;
   font-size: 12px;
   color: #75695c;
+}
+
+.checkbox {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.checkbox input {
+  width: auto;
 }
 
 ul {
