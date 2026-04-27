@@ -57,6 +57,27 @@ function json(res, status, data) {
   res.end(payload);
 }
 
+function sanitizeProxyHeaders(headers) {
+  const blocked = new Set(['host', 'content-length', 'connection']);
+  const nextHeaders = {};
+  for (const [name, value] of Object.entries(headers || {})) {
+    const headerName = String(name || '').trim();
+    if (!headerName || blocked.has(headerName.toLowerCase())) continue;
+    nextHeaders[headerName] = String(value ?? '');
+  }
+  return nextHeaders;
+}
+
+async function readResponseBody(response) {
+  const text = await response.text();
+  if (!text) return {};
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
+}
+
 function pruneExpiredStates() {
   const now = Date.now();
   for (const [state, record] of pendingStates.entries()) {
@@ -196,6 +217,66 @@ const server = createServer(async (req, res) => {
       authorizeUrl,
       generatedAt: new Date().toISOString(),
     });
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/demo-api/test/request') {
+    let payload;
+    try {
+      payload = await readBody(req);
+    } catch (error) {
+      json(res, 400, { error: `请求体 JSON 解析失败: ${String(error)}` });
+      return;
+    }
+
+    const method = String(payload.method || 'GET').toUpperCase();
+    const targetUrl = String(payload.url || '').trim();
+    const headers = sanitizeProxyHeaders(payload.headers);
+    const body = typeof payload.body === 'string' ? payload.body : '';
+
+    if (!targetUrl) {
+      json(res, 400, { error: '缺少 url' });
+      return;
+    }
+
+    try {
+      const upstream = await fetch(targetUrl, {
+        method,
+        headers,
+        body: ['GET', 'HEAD'].includes(method) ? undefined : body,
+      });
+      const upstreamHeaders = Object.fromEntries(upstream.headers.entries());
+      const upstreamBody = await readResponseBody(upstream);
+
+      json(res, 200, {
+        success: upstream.ok,
+        request: {
+          url: targetUrl,
+          method,
+          headers,
+          body: ['GET', 'HEAD'].includes(method) ? '' : body,
+          via: 'server.mjs',
+        },
+        response: {
+          status: upstream.status,
+          statusText: upstream.statusText,
+          headers: upstreamHeaders,
+          body: upstreamBody,
+        },
+      });
+    } catch (error) {
+      json(res, 502, {
+        success: false,
+        request: {
+          url: targetUrl,
+          method,
+          headers,
+          body: ['GET', 'HEAD'].includes(method) ? '' : body,
+          via: 'server.mjs',
+        },
+        error: String(error),
+      });
+    }
     return;
   }
 

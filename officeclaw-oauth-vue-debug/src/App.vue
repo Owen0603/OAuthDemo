@@ -190,6 +190,22 @@ async function callApi(path: string, init?: RequestInit): Promise<{ ok: boolean;
   return { ok: res.ok, status: res.status, data };
 }
 
+async function callServerProxyDebug(payload: {
+  url: string;
+  method: string;
+  headers: Record<string, string>;
+  body: string;
+}): Promise<{ ok: boolean; status: number; data: ApiResponse }> {
+  return callApi('/test/request', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+}
+
 async function callApiDirect(url: string, init?: RequestInit): Promise<{ ok: boolean; status: number; data: ApiResponse }> {
   let res: Response;
   try {
@@ -223,16 +239,6 @@ function buildTokenRequestBody(grantType: 'authorization_code' | 'refresh_token'
     grant_type: 'authorization_code',
     redirect_uri: String(config.value?.redirectUri || ''),
   });
-}
-
-function guessDirectCallIssue(error: unknown, includeDpop: boolean): string {
-  const text = String(error || '');
-  if (/TypeError: Failed to fetch|Load failed|NetworkError|Network request failed/i.test(text)) {
-    return includeDpop
-      ? '浏览器直连通常会先发 CORS 预检；当前请求带了 DPoP 自定义请求头，服务端若未放行 OPTIONS 或 Access-Control-Allow-Headers 里未包含 DPoP，浏览器会直接拦截。'
-      : '浏览器直连失败且没有拿到 HTTP 响应，通常是目标接口未返回允许当前来源的 CORS 头，或 TLS / 网络层被浏览器拦截。';
-  }
-  return '浏览器已发起请求，但失败原因需要结合 DevTools Network 查看预检 OPTIONS 和实际 POST。';
 }
 
 function parseHeadersText(source: string): Record<string, string> {
@@ -279,40 +285,13 @@ async function runTestRequest(): Promise<void> {
     }
 
     const method = testMethod.value.toUpperCase();
-    try {
-      const response = await fetchWithTimeout(url, {
-        method,
-        headers,
-        body: shouldAttachBody(method) ? testBody.value : undefined,
-        credentials: testUseCredentials.value ? 'include' : 'same-origin',
-      });
-      const responseText = await response.text();
-      const responseHeaders = Object.fromEntries(response.headers.entries());
-      let responseBody: ApiResponse | string = responseText;
-      try {
-        responseBody = responseText ? (JSON.parse(responseText) as ApiResponse) : {};
-      } catch {
-        responseBody = responseText;
-      }
-
-      testResult.value = {
-        success: response.ok,
-        request: {
-          url,
-          method,
-          headers,
-          body: shouldAttachBody(method) ? testBody.value : '',
-          credentials: testUseCredentials.value ? 'include' : 'same-origin',
-        },
-        response: {
-          status: response.status,
-          statusText: response.statusText,
-          headers: responseHeaders,
-          body: responseBody,
-        },
-      };
-      log(`Test 路由调用完成: status=${response.status}`);
-    } catch (error) {
+    const res = await callServerProxyDebug({
+      url,
+      method,
+      headers,
+      body: shouldAttachBody(method) ? testBody.value : '',
+    });
+    if (!res.ok) {
       testResult.value = {
         success: false,
         request: {
@@ -320,13 +299,16 @@ async function runTestRequest(): Promise<void> {
           method,
           headers,
           body: shouldAttachBody(method) ? testBody.value : '',
-          credentials: testUseCredentials.value ? 'include' : 'same-origin',
+          via: 'server.mjs',
         },
-        error: String(error),
-        diagnosis: '浏览器未拿到响应时，优先检查 CORS、预检 OPTIONS、证书、网络代理和目标域名白名单。',
+        error: res.data.error || 'server.mjs 转发失败',
       };
-      log(`Test 路由调用失败: ${String(error)}`);
+      log(`Test 路由调用失败: ${String(res.data.error || res.status)}`);
+      return;
     }
+
+    testResult.value = res.data;
+    log(`Test 路由调用完成: status=${String((res.data.response as ApiResponse | undefined)?.status || '')}`);
   });
 }
 
@@ -510,7 +492,7 @@ async function step4ExchangeToken(): Promise<void> {
 }
 
 async function step4DirectExchangeToken(): Promise<void> {
-  await withBusy('Step4 浏览器直连 IAM_TOKEN_URL', async () => {
+  await withBusy('Step4 通过 server.mjs 直调 IAM_TOKEN_URL', async () => {
     if (callbackError.value.trim()) {
       log(`回调包含 error: ${callbackError.value}`);
       return;
@@ -534,36 +516,14 @@ async function step4DirectExchangeToken(): Promise<void> {
     }
 
     const body = buildTokenRequestBody('authorization_code');
-    try {
-      const response = await fetchWithTimeout(tokenEndpoint, {
-        method: 'POST',
-        headers,
-        body: body.toString(),
-      });
+    const res = await callServerProxyDebug({
+      url: tokenEndpoint,
+      method: 'POST',
+      headers,
+      body: body.toString(),
+    });
 
-      const responseText = await response.text();
-      let parsedBody: ApiResponse | string = responseText;
-      try {
-        parsedBody = responseText ? (JSON.parse(responseText) as ApiResponse) : {};
-      } catch {
-        parsedBody = responseText;
-      }
-
-      directTokenResult.value = {
-        success: response.ok,
-        status: response.status,
-        statusText: response.statusText,
-        request: {
-          url: tokenEndpoint,
-          method: 'POST',
-          includeDpop: directCallIncludeDpop.value,
-          headers,
-          body: body.toString(),
-        },
-        response: parsedBody,
-      };
-      log(`浏览器直连 IAM 完成: status=${response.status}`);
-    } catch (error) {
+    if (!res.ok) {
       directTokenResult.value = {
         success: false,
         request: {
@@ -572,12 +532,22 @@ async function step4DirectExchangeToken(): Promise<void> {
           includeDpop: directCallIncludeDpop.value,
           headers,
           body: body.toString(),
+          via: 'server.mjs',
         },
-        error: String(error),
-        diagnosis: guessDirectCallIssue(error, directCallIncludeDpop.value),
+        error: String(res.data.error || 'server.mjs 转发失败'),
       };
-      log(`浏览器直连 IAM 失败: ${String(error)}`);
+      log(`server.mjs 调 IAM 失败: ${String(res.data.error || res.status)}`);
+      return;
     }
+
+    directTokenResult.value = {
+      ...res.data,
+      request: {
+        ...(res.data.request as ApiResponse | undefined),
+        includeDpop: directCallIncludeDpop.value,
+      },
+    };
+    log(`server.mjs 调 IAM 完成: status=${String((res.data.response as ApiResponse | undefined)?.status || '')}`);
   });
 }
 
@@ -761,14 +731,14 @@ onMounted(async () => {
     </section>
 
     <section class="card">
-      <h2>IAM_TOKEN_URL 直连调试</h2>
-      <p class="hint">这个按钮会让浏览器直接 POST 到当前配置里的 IAM_TOKEN_URL，不经过 Vite 代理，可用于判断是不是浏览器侧 CORS / 预检问题。</p>
+      <h2>IAM_TOKEN_URL 调试</h2>
+      <p class="hint">这个按钮会先把请求发给本地 server.mjs，再由 server.mjs 转发到当前配置里的 IAM_TOKEN_URL，避免浏览器跨域干扰。</p>
       <label class="checkbox">
         <input v-model="directCallIncludeDpop" :disabled="busy" type="checkbox" />
-        <span>带上 DPoP 请求头一起直连</span>
+        <span>带上 DPoP 请求头一起转发</span>
       </label>
       <div class="row">
-        <button :disabled="busy" @click="step4DirectExchangeToken">直接调用 IAM_TOKEN_URL</button>
+        <button :disabled="busy" @click="step4DirectExchangeToken">通过 server.mjs 调用 IAM_TOKEN_URL</button>
       </div>
       <pre>{{ directTokenResult }}</pre>
     </section>
@@ -804,7 +774,7 @@ onMounted(async () => {
   <main v-else class="page page-test">
     <header class="header card">
       <h1>接口直调 Test 路由</h1>
-      <p>这个页面只做一件事：在浏览器里按你填写的 URL、Header、Body 原样发请求，方便确认是不是浏览器环境导致失败。</p>
+      <p>这个页面只做一件事：把你填写的 URL、Header、Body 发给本地 server.mjs，再由 server.mjs 原样转发到目标接口，避免浏览器跨域影响。</p>
       <div class="row">
         <button :disabled="busy" @click="navigateTo('/')">返回 OAuth Demo</button>
         <button :disabled="busy" @click="fillIamTokenTemplate">填充 IAM_TOKEN_URL 模板</button>
@@ -841,11 +811,11 @@ onMounted(async () => {
           placeholder="grant_type=authorization_code&client_id=..."
         />
         <label class="checkbox">
-          <input v-model="testUseCredentials" :disabled="busy" type="checkbox" />
-          <span>携带 credentials=include</span>
+          <input v-model="testUseCredentials" :disabled="true" type="checkbox" />
+          <span>浏览器 credentials 在 server 代理模式下不生效</span>
         </label>
         <div class="row">
-          <button :disabled="busy" @click="runTestRequest">直接调用</button>
+          <button :disabled="busy" @click="runTestRequest">通过 server.mjs 调用</button>
         </div>
       </article>
 
